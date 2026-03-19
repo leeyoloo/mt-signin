@@ -19,7 +19,10 @@ jobs:
           python-version: '3.11'
 
       - name: 安装依赖
-        run: pip install -r requirements.txt
+        run: |
+          pip install playwright
+          playwright install chromium
+          playwright install-deps chromium
 
       - name: 执行签到
         env:

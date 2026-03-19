@@ -2,161 +2,92 @@
 """
 MT论坛 (bbs.binmt.cc) 每日自动签到
 基于 dsu_pa498 签到插件，通过 cookie 登录 + POST 请求完成签到。
+使用 Playwright 无头浏览器绕过滑块验证。
 """
 import os
 import sys
 import re
-import requests
+import time
 from datetime import datetime, timezone, timedelta
 
 BASE_URL = "https://bbs.binmt.cc"
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Linux; Android 14; Pixel 8) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/120.0.0.0 Mobile Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-    "Referer": BASE_URL + "/",
-}
-
-
-def get_formhash(session):
-    """从页面获取 formhash，多种方式尝试"""
-    # 先从首页尝试
-    resp = session.get(f"{BASE_URL}/forum.php", headers=HEADERS, timeout=15)
-    resp.encoding = "utf-8"
-    fh = _extract_formhash(resp.text)
-    if fh:
-        return fh
-
-    # 首页不行就试试个人中心
-    resp = session.get(f"{BASE_URL}/home.php?mod=space", headers=HEADERS, timeout=15)
-    resp.encoding = "utf-8"
-    fh = _extract_formhash(resp.text)
-    if fh:
-        return fh
-
-    # 再试试签到页面本身
-    resp = session.get(
-        f"{BASE_URL}/plugin.php?id=dsu_pa498:sign&operation=qiandao&infloat=1&inajax=1",
-        headers={**HEADERS, "X-Requested-With": "XMLHttpRequest"},
-        timeout=15,
-    )
-    resp.encoding = "utf-8"
-    fh = _extract_formhash(resp.text)
-    if fh:
-        return fh
-
-    print("❌ 无法从任何页面获取 formhash")
-    print(f"   最后页面内容前500字: {resp.text[:500]}")
-    return None
-
-
-def _extract_formhash(html):
-    """从 HTML 中提取 formhash，覆盖多种 Discuz! 模板写法"""
-    # URL 参数: formhash=xxxx
-    m = re.search(r'formhash=([a-f0-9]+)', html)
-    if m:
-        return m.group(1)
-    # 隐藏字段: name="formhash" value="xxxx"
-    m = re.search(r'name=["\']formhash["\'][^>]*value=["\']([a-f0-9]+)["\']', html)
-    if m:
-        return m.group(1)
-    # 有时 value 在 name 前面
-    m = re.search(r'value=["\']([a-f0-9]+)["\'][^>]*name=["\']formhash["\']', html)
-    if m:
-        return m.group(1)
-    # JS 变量: formhash = 'xxxx' 或 formhash:"xxxx"
-    m = re.search(r'formhash["\s:=]+["\']([a-f0-9]+)["\']', html)
-    if m:
-        return m.group(1)
-    # 通配：formhash 后面紧跟的任何十六进制串
-    m = re.search(r'formhash[^a-f0-9]*([a-f0-9]{6,})', html)
-    if m:
-        return m.group(1)
-    return None
-
-
-def check_logged_in(session):
-    """检查是否已登录（通过 cookie）"""
-    resp = session.get(f"{BASE_URL}/forum.php", headers=HEADERS, timeout=15)
-    resp.encoding = "utf-8"
-    # 登录后页面会有"退出"或"注销"链接，以及个人中心入口
-    if "logging&action=logout" in resp.text or "member.php?mod=logging&action=logout" in resp.text:
-        return True
-    # 也检查是否有 auth cookie
-    for cookie in session.cookies:
-        if "auth" in cookie.name.lower():
-            return True
-    return False
-
 
 def parse_cookies(cookie_string):
-    """解析 cookie 字符串为字典并加载到 session"""
-    cookies = {}
+    """解析 cookie 字符串为 Playwright 格式"""
+    cookies = []
     for item in cookie_string.split(";"):
         item = item.strip()
         if "=" in item:
             key, _, value = item.partition("=")
-            cookies[key.strip()] = value.strip()
+            cookies.append({
+                "name": key.strip(),
+                "value": value.strip(),
+                "domain": "bbs.binmt.cc",
+                "path": "/",
+            })
     return cookies
 
 
-def check_already_signed(session):
-    """检查是否已签到"""
-    resp = session.get(
-        f"{BASE_URL}/plugin.php?id=dsu_pa498:sign&operation=qiandao&infloat=1&inajax=1",
-        headers={**HEADERS, "X-Requested-With": "XMLHttpRequest"},
-        timeout=15,
-    )
-    resp.encoding = "utf-8"
-    return "已经签到" in resp.text or "已签到" in resp.text
+def get_formhash(page):
+    """从当前页面获取 formhash"""
+    html = page.content()
+    for pattern in [
+        r'formhash=([a-f0-9]+)',
+        r'name=["\']formhash["\'][^>]*value=["\']([a-f0-9]+)["\']',
+        r'value=["\']([a-f0-9]+)["\'][^>]*name=["\']formhash["\']',
+        r'formhash["\s:=]+["\']([a-f0-9]+)["\']',
+    ]:
+        m = re.search(pattern, html)
+        if m:
+            return m.group(1)
+    return None
 
 
-def sign_dsu_pa498(session, formhash):
-    """使用 dsu_pa498 插件签到（POST）"""
-    print("📝 正在签到 (dsu_pa498)...")
+def wait_for_guard(page, timeout=30):
+    """等待滑块验证自动完成或页面加载完成"""
+    print("⏳ 等待页面加载（可能有滑块验证）...")
+    # 先等一会，让滑块 JS 执行
+    time.sleep(3)
 
-    try:
-        resp = session.post(
-            f"{BASE_URL}/plugin.php?id=dsu_pa498:sign&operation=qiandao&infloat=1&inajax=1",
-            data={
-                "formhash": formhash,
-                "qdxq": "kx",
-                "qdmode": "3",
-                "todaysay": "",
-                "faession": "1",
-            },
-            headers={
-                **HEADERS,
-                "X-Requested-With": "XMLHttpRequest",
-                "Content-Type": "application/x-www-form-urlencoded",
-            },
-            timeout=15,
-        )
-        resp.encoding = "utf-8"
-        text = resp.text
+    for _ in range(timeout):
+        # 检查是否还在验证页面
+        html = page.content()
+        if "_guard" not in html and "slider" not in html:
+            print("✅ 页面加载完成（已通过验证）")
+            return True
+        # 检查是否需要手动滑块（有 canvas 或 slider 元素）
+        if page.query_selector('.slider') or page.query_selector('canvas'):
+            print("⚠️ 检测到滑块，尝试自动处理...")
+            # 尝试模拟滑动
+            try:
+                slider = page.query_selector('.slider') or page.query_selector('[class*="slider"]')
+                if slider:
+                    box = slider.bounding_box()
+                    if box:
+                        page.mouse.move(box['x'] + box['width']/2, box['y'] + box['height']/2)
+                        page.mouse.down()
+                        # 模拟人类滑动
+                        steps = 20
+                        for i in range(steps):
+                            page.mouse.move(
+                                box['x'] + box['width']/2 + (i * 10),
+                                box['y'] + box['height']/2,
+                                steps=5
+                            )
+                            time.sleep(0.02)
+                        page.mouse.up()
+                        time.sleep(2)
+            except Exception as e:
+                print(f"   滑块处理异常: {e}")
+        time.sleep(1)
 
-        if "已经签到" in text or "已签到" in text:
-            print("✅ 今天已经签到过了")
-            return True, "已签到"
-        elif "成功" in text or "恭喜" in text:
-            reward = re.search(r'(\d+)\s*(?:金钱|积分|金币)', text)
-            detail = f"，获得 {reward.group(1)} 积分" if reward else ""
-            print(f"✅ 签到成功{detail}")
-            return True, f"签到成功{detail}"
-        else:
-            print(f"⚠️ 签到状态不明确: {text[:200]}")
-            return False, "状态不明"
-    except Exception as e:
-        print(f"❌ 签到异常: {e}")
-        return False, str(e)
+    print("⚠️ 验证等待超时，继续尝试...")
+    return False
 
 
 def main():
     cookie_string = os.environ.get("MT_COOKIE", "")
-
     if not cookie_string:
         print("❌ 请设置环境变量 MT_COOKIE")
         print("   获取方式：浏览器登录论坛 → F12 → Network → 复制 Cookie 头")
@@ -168,43 +99,116 @@ def main():
     print(f"🌐 {BASE_URL}")
     print("=" * 50)
 
-    session = requests.Session()
-
-    # 加载 cookie（多个域名都设置，兼容 www 和非 www）
-    cookies = parse_cookies(cookie_string)
-    for domain in ["bbs.binmt.cc", ".bbs.binmt.cc", "www.bbs.binmt.cc"]:
-        for k, v in cookies.items():
-            session.cookies.set(k, v, domain=domain)
-
-    # 检查登录状态
-    if not check_logged_in(session):
-        print("❌ Cookie 无效或已过期，请重新获取")
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("❌ Playwright 未安装")
         sys.exit(1)
 
-    print("✅ Cookie 有效，已登录")
-    print()
+    with sync_playwright() as p:
+        # 启动无头浏览器
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-blink-features=AutomationControlled',
+            ]
+        )
 
-    # 获取 formhash
-    formhash = get_formhash(session)
-    if not formhash:
-        print("❌ 无法获取 formhash")
-        sys.exit(1)
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Linux; Android 14; Pixel 8) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/120.0.0.0 Mobile Safari/537.36",
+            viewport={"width": 390, "height": 844},
+            locale="zh-CN",
+        )
 
-    # 检查是否已签到
-    if check_already_signed(session):
-        print("🎉 今天已经签到过了！")
-        return
+        # 注入 cookie
+        cookies = parse_cookies(cookie_string)
+        context.add_cookies(cookies)
 
-    # 执行签到
-    ok, msg = sign_dsu_pa498(session, formhash)
+        page = context.new_page()
+
+        # 注入反检测脚本
+        page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => false});
+            window.chrome = {runtime: {}};
+        """)
+
+        # 访问首页
+        print("🌐 正在访问论坛首页...")
+        page.goto(f"{BASE_URL}/forum.php", wait_until="domcontentloaded", timeout=30000)
+        wait_for_guard(page)
+
+        # 检查是否登录
+        html = page.content()
+        if "logging&action=logout" in html:
+            print("✅ Cookie 有效，已登录")
+        else:
+            print("❌ Cookie 无效或已过期")
+            browser.close()
+            sys.exit(1)
+
+        print()
+
+        # 获取 formhash
+        formhash = get_formhash(page)
+        if not formhash:
+            print("❌ 无法获取 formhash")
+            print(f"   页面内容前500字: {html[:500]}")
+            browser.close()
+            sys.exit(1)
+
+        print(f"📋 formhash: {formhash}")
+
+        # 检查是否已签到
+        page.goto(
+            f"{BASE_URL}/plugin.php?id=dsu_pa498:sign&operation=qiandao&infloat=1&inajax=1",
+            wait_until="domcontentloaded",
+            timeout=30000,
+        )
+        time.sleep(2)
+        sign_html = page.content()
+
+        if "已经签到" in sign_html or "已签到" in sign_html:
+            print("🎉 今天已经签到过了！")
+            browser.close()
+            return
+
+        # 执行签到
+        print("📝 正在签到 (dsu_pa498)...")
+
+        # 用 Playwright 发起 POST 请求
+        response = page.evaluate(f"""
+            async () => {{
+                const resp = await fetch('{BASE_URL}/plugin.php?id=dsu_pa498:sign&operation=qiandao&infloat=1&inajax=1', {{
+                    method: 'POST',
+                    headers: {{
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                        'X-Requested-With': 'XMLHttpRequest',
+                    }},
+                    body: 'formhash={formhash}&qdxq=kx&qdmode=3&todaysay=&faession=1',
+                }});
+                return await resp.text();
+            }}
+        """)
+
+        result_text = response if response else ""
+        if "已经签到" in result_text or "已签到" in result_text:
+            print("✅ 今天已经签到过了")
+        elif "成功" in result_text or "恭喜" in result_text:
+            reward = re.search(r'(\d+)\s*(?:金钱|积分|金币)', result_text)
+            detail = f"，获得 {reward.group(1)} 积分" if reward else ""
+            print(f"✅ 签到成功{detail}")
+        else:
+            print(f"⚠️ 签到结果: {result_text[:300]}")
+
+        browser.close()
 
     print()
     print("=" * 50)
-    if ok:
-        print(f"🎉 {msg}")
-    else:
-        print(f"⚠️ {msg}")
-        sys.exit(1)
+    print("🎉 完成！")
 
 
 if __name__ == "__main__":
