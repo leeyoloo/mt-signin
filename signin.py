@@ -22,15 +22,59 @@ HEADERS = {
 
 
 def get_formhash(session):
-    """从首页获取 formhash"""
+    """从页面获取 formhash，多种方式尝试"""
+    # 先从首页尝试
     resp = session.get(f"{BASE_URL}/forum.php", headers=HEADERS, timeout=15)
     resp.encoding = "utf-8"
-    match = re.search(r'formhash=([a-f0-9]+)', resp.text)
-    if match:
-        return match.group(1)
-    match = re.search(r'name="formhash"\s+value="([a-f0-9]+)"', resp.text)
-    if match:
-        return match.group(1)
+    fh = _extract_formhash(resp.text)
+    if fh:
+        return fh
+
+    # 首页不行就试试个人中心
+    resp = session.get(f"{BASE_URL}/home.php?mod=space", headers=HEADERS, timeout=15)
+    resp.encoding = "utf-8"
+    fh = _extract_formhash(resp.text)
+    if fh:
+        return fh
+
+    # 再试试签到页面本身
+    resp = session.get(
+        f"{BASE_URL}/plugin.php?id=dsu_pa498:sign&operation=qiandao&infloat=1&inajax=1",
+        headers={**HEADERS, "X-Requested-With": "XMLHttpRequest"},
+        timeout=15,
+    )
+    resp.encoding = "utf-8"
+    fh = _extract_formhash(resp.text)
+    if fh:
+        return fh
+
+    print("❌ 无法从任何页面获取 formhash")
+    print(f"   最后页面内容前500字: {resp.text[:500]}")
+    return None
+
+
+def _extract_formhash(html):
+    """从 HTML 中提取 formhash，覆盖多种 Discuz! 模板写法"""
+    # URL 参数: formhash=xxxx
+    m = re.search(r'formhash=([a-f0-9]+)', html)
+    if m:
+        return m.group(1)
+    # 隐藏字段: name="formhash" value="xxxx"
+    m = re.search(r'name=["\']formhash["\'][^>]*value=["\']([a-f0-9]+)["\']', html)
+    if m:
+        return m.group(1)
+    # 有时 value 在 name 前面
+    m = re.search(r'value=["\']([a-f0-9]+)["\'][^>]*name=["\']formhash["\']', html)
+    if m:
+        return m.group(1)
+    # JS 变量: formhash = 'xxxx' 或 formhash:"xxxx"
+    m = re.search(r'formhash["\s:=]+["\']([a-f0-9]+)["\']', html)
+    if m:
+        return m.group(1)
+    # 通配：formhash 后面紧跟的任何十六进制串
+    m = re.search(r'formhash[^a-f0-9]*([a-f0-9]{6,})', html)
+    if m:
+        return m.group(1)
     return None
 
 
@@ -126,10 +170,11 @@ def main():
 
     session = requests.Session()
 
-    # 加载 cookie
+    # 加载 cookie（多个域名都设置，兼容 www 和非 www）
     cookies = parse_cookies(cookie_string)
-    for k, v in cookies.items():
-        session.cookies.set(k, v, domain="bbs.binmt.cc")
+    for domain in ["bbs.binmt.cc", ".bbs.binmt.cc", "www.bbs.binmt.cc"]:
+        for k, v in cookies.items():
+            session.cookies.set(k, v, domain=domain)
 
     # 检查登录状态
     if not check_logged_in(session):
