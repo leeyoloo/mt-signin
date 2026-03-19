@@ -2,7 +2,7 @@
 """
 MT论坛 (bbs.binmt.cc) 每日自动签到
 基于 dsu_pa498 签到插件，通过 cookie 登录 + POST 请求完成签到。
-使用 Playwright 无头浏览器绕过滑块验证。
+使用 Playwright stealth 无头浏览器绕过滑块验证。
 """
 import os
 import sys
@@ -44,53 +44,10 @@ def get_formhash(page):
     return None
 
 
-def wait_for_guard(page, timeout=30):
-    """等待滑块验证自动完成或页面加载完成"""
-    print("⏳ 等待页面加载（可能有滑块验证）...")
-    # 先等一会，让滑块 JS 执行
-    time.sleep(3)
-
-    for _ in range(timeout):
-        # 检查是否还在验证页面
-        html = page.content()
-        if "_guard" not in html and "slider" not in html:
-            print("✅ 页面加载完成（已通过验证）")
-            return True
-        # 检查是否需要手动滑块（有 canvas 或 slider 元素）
-        if page.query_selector('.slider') or page.query_selector('canvas'):
-            print("⚠️ 检测到滑块，尝试自动处理...")
-            # 尝试模拟滑动
-            try:
-                slider = page.query_selector('.slider') or page.query_selector('[class*="slider"]')
-                if slider:
-                    box = slider.bounding_box()
-                    if box:
-                        page.mouse.move(box['x'] + box['width']/2, box['y'] + box['height']/2)
-                        page.mouse.down()
-                        # 模拟人类滑动
-                        steps = 20
-                        for i in range(steps):
-                            page.mouse.move(
-                                box['x'] + box['width']/2 + (i * 10),
-                                box['y'] + box['height']/2,
-                                steps=5
-                            )
-                            time.sleep(0.02)
-                        page.mouse.up()
-                        time.sleep(2)
-            except Exception as e:
-                print(f"   滑块处理异常: {e}")
-        time.sleep(1)
-
-    print("⚠️ 验证等待超时，继续尝试...")
-    return False
-
-
 def main():
     cookie_string = os.environ.get("MT_COOKIE", "")
     if not cookie_string:
         print("❌ 请设置环境变量 MT_COOKIE")
-        print("   获取方式：浏览器登录论坛 → F12 → Network → 复制 Cookie 头")
         sys.exit(1)
 
     cst = timezone(timedelta(hours=8))
@@ -101,27 +58,31 @@ def main():
 
     try:
         from playwright.sync_api import sync_playwright
-    except ImportError:
-        print("❌ Playwright 未安装")
+        from playwright_stealth import stealth_sync
+    except ImportError as e:
+        print(f"❌ 缺少依赖: {e}")
         sys.exit(1)
 
     with sync_playwright() as p:
-        # 启动无头浏览器
         browser = p.chromium.launch(
             headless=True,
             args=[
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
                 '--disable-blink-features=AutomationControlled',
+                '--disable-dev-shm-usage',
             ]
         )
 
         context = browser.new_context(
-            user_agent="Mozilla/5.0 (Linux; Android 14; Pixel 8) "
-                       "AppleWebKit/537.36 (KHTML, like Gecko) "
-                       "Chrome/120.0.0.0 Mobile Safari/537.36",
-            viewport={"width": 390, "height": 844},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1366, "height": 768},
             locale="zh-CN",
+            timezone_id="Asia/Shanghai",
         )
 
         # 注入 cookie
@@ -129,22 +90,37 @@ def main():
         context.add_cookies(cookies)
 
         page = context.new_page()
-
-        # 注入反检测脚本
-        page.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {get: () => false});
-            window.chrome = {runtime: {}};
-        """)
+        stealth_sync(page)  # 反检测
 
         # 访问首页
         print("🌐 正在访问论坛首页...")
         page.goto(f"{BASE_URL}/forum.php", wait_until="domcontentloaded", timeout=30000)
-        wait_for_guard(page)
+
+        # 截图保存，方便调试
+        page.screenshot(path="/tmp/mt_page.png", full_page=False)
+        print(f"📸 页面截图已保存")
+
+        # 等待页面稳定
+        time.sleep(5)
+
+        # 检查是否还在验证页面
+        html = page.content()
+        if "_guard" in html or "slider" in html:
+            print("⚠️ 仍在滑块验证页面，尝试等待更长时间...")
+            time.sleep(10)
+            html = page.content()
+
+        # 再截一张
+        page.screenshot(path="/tmp/mt_page2.png", full_page=False)
 
         # 检查是否登录
-        html = page.content()
         if "logging&action=logout" in html:
             print("✅ Cookie 有效，已登录")
+        elif "_guard" in html:
+            print("❌ 滑块验证未通过，无法访问论坛")
+            print(f"   页面内容前300字: {html[:300]}")
+            browser.close()
+            sys.exit(1)
         else:
             print("❌ Cookie 无效或已过期")
             browser.close()
@@ -155,18 +131,24 @@ def main():
         # 获取 formhash
         formhash = get_formhash(page)
         if not formhash:
+            # 尝试导航到其他页面
+            page.goto(f"{BASE_URL}/home.php?mod=space", wait_until="domcontentloaded", timeout=15000)
+            time.sleep(2)
+            formhash = get_formhash(page)
+
+        if not formhash:
             print("❌ 无法获取 formhash")
-            print(f"   页面内容前500字: {html[:500]}")
             browser.close()
             sys.exit(1)
 
         print(f"📋 formhash: {formhash}")
 
         # 检查是否已签到
+        print("📝 检查签到状态...")
         page.goto(
             f"{BASE_URL}/plugin.php?id=dsu_pa498:sign&operation=qiandao&infloat=1&inajax=1",
             wait_until="domcontentloaded",
-            timeout=30000,
+            timeout=15000,
         )
         time.sleep(2)
         sign_html = page.content()
@@ -179,7 +161,6 @@ def main():
         # 执行签到
         print("📝 正在签到 (dsu_pa498)...")
 
-        # 用 Playwright 发起 POST 请求
         response = page.evaluate(f"""
             async () => {{
                 const resp = await fetch('{BASE_URL}/plugin.php?id=dsu_pa498:sign&operation=qiandao&infloat=1&inajax=1', {{
